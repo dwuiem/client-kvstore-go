@@ -3,95 +3,67 @@ package client_kvstore_go
 import (
 	"context"
 	"errors"
+	"fmt"
 	kvstore "github.com/HSE-RDBMS-course-work/kvstore-proto/gen/go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"sync/atomic"
-	"time"
 )
 
+var errIsNotLeader = errors.New("not leader")
+
 type KVStoreClient struct {
-	clients []*client
-	leader  atomic.Value
+	clients     []*client
+	leaderIndex atomic.Int32
 }
 
-func NewKVStoreClient(username, password string, addresses []string) (*KVStoreClient, error) {
-	if len(addresses) == 0 {
-		return nil, errors.New("no addresses provided")
+func NewKVStoreClient(username, password string, addresses []string, opts []grpc.DialOption) (*KVStoreClient, error) {
+	if len(username) == 0 {
+		return nil, ErrUsernameNotValid
 	}
-
-	authInterceptor := newAuthInterceptor(username, password)
+	if len(password) == 0 {
+		return nil, ErrPasswordNotValid
+	}
+	if len(addresses) == 0 {
+		return nil, ErrNoAddressProvided
+	}
+	opts = append(opts, grpc.WithUnaryInterceptor(
+		newAuthInterceptor(username, password),
+	))
 	c := &KVStoreClient{
-		clients: make([]*client, len(addresses)),
-		leader:  atomic.Value{},
+		clients:     make([]*client, len(addresses)),
+		leaderIndex: atomic.Int32{},
 	}
 	for i, address := range addresses {
-		opts := []grpc.DialOption{
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithUnaryInterceptor(authInterceptor),
-		}
 		newClient, err := newClient(address, opts)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to connect to %s: %w", address, err)
 		}
 		c.clients[i] = newClient
 	}
-	ldr, err := c.findNewLeader()
-	if err != nil {
-		return nil, err
-	}
-	c.leader.Store(ldr)
+	c.leaderIndex.Store(0)
 	return c, nil
 }
 
-// todo clear unavailable nodes, retries
-// findNewLeader return a new leader of store
-func (c *KVStoreClient) findNewLeader() (*client, error) {
-	for _, client := range c.clients {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err := client.api.Put(ctx, &kvstore.PutIn{
-			Key:   "Key",
-			Value: "Value",
-			Ttl:   1,
-		})
-		cancel()
-
-		if err != nil {
-			st, ok := status.FromError(err)
-			if !ok {
-				panic(err) // TODO
-			}
-			switch st.Code() {
-			case codes.Unavailable:
-				_ = client.closeConn()
-			}
-		} else {
-			return client, nil
-		}
-	}
-	return nil, errors.New("no leader found")
-}
-
-func (c *KVStoreClient) updateLeader() error {
-	newLeader, err := c.findNewLeader()
+func (c *KVStoreClient) execute(req func() error) error {
+	err := req()
 	if err != nil {
-		return errors.New("error getting leader")
-	}
-	c.leader.Store(newLeader)
-	return nil
-}
-
-func (c *KVStoreClient) getLeader() (*client, error) {
-	ldr := c.leader.Load()
-	if ldr == nil {
-		err := c.updateLeader()
-		if err != nil {
-			return nil, err
+		except := c.leaderIndex.Load()
+		for i := range c.clients {
+			if i == int(except) {
+				continue
+			}
+			c.setLeader(i)
+			err := req()
+			if err != nil {
+				continue
+			}
+			return nil
 		}
+		return ErrNoAvailableLeader
 	}
-	return ldr.(*client), nil
+	return nil
 }
 
 func (c *KVStoreClient) Close() error {
@@ -102,5 +74,143 @@ func (c *KVStoreClient) Close() error {
 		client.api = nil
 	}
 	c.clients = nil
+	return nil
+}
+
+func (c *KVStoreClient) setLeader(new int) {
+	old := c.leaderIndex.Load()
+	c.leaderIndex.CompareAndSwap(old, int32(new))
+}
+
+// todo handle errors
+
+func (c *KVStoreClient) Put(ctx context.Context, key, value string, ttl int64) error {
+	var err error
+	executeErr := c.execute(func() error {
+		err = c.tryPut(ctx, key, value, ttl)
+		if errors.Is(err, errIsNotLeader) {
+			return err
+		}
+		return nil
+	})
+	if executeErr != nil {
+		return ErrNoAvailableLeader
+	}
+	return err
+}
+
+func (c *KVStoreClient) Get(ctx context.Context, key string) (string, error) {
+	var value string
+	var err error
+
+	executeErr := c.execute(func() error {
+		value, err = c.tryGet(ctx, key)
+		if errors.Is(err, errIsNotLeader) {
+			return err
+		}
+		return nil
+	})
+
+	if executeErr != nil {
+		return "", ErrNoAvailableLeader
+	}
+	return value, err
+}
+
+func (c *KVStoreClient) ConsistentGet(ctx context.Context, key string) (string, error) {
+	var value string
+	var err error
+
+	executeErr := c.execute(func() error {
+		value, err = c.tryConsistentGet(ctx, key)
+		if errors.Is(err, errIsNotLeader) {
+			return err
+		}
+		return nil
+	})
+
+	if executeErr != nil {
+		return "", ErrNoAvailableLeader
+	}
+
+	return value, err
+}
+
+func (c *KVStoreClient) Delete(ctx context.Context, key string) error {
+	var err error
+	executeErr := c.execute(func() error {
+		err = c.tryDelete(ctx, key)
+		if errors.Is(err, errIsNotLeader) {
+			return err
+		}
+		return nil
+	})
+
+	if executeErr != nil {
+		return ErrNoAvailableLeader
+	}
+	return err
+}
+
+func (c *KVStoreClient) tryPut(ctx context.Context, key, value string, ttl int64) error {
+	client := c.clients[c.leaderIndex.Load()]
+	_, err := client.api.Put(ctx, &kvstore.PutIn{
+		Key:   key,
+		Value: value,
+		Ttl:   ttl,
+	})
+	if err != nil {
+		_, ok := status.FromError(err)
+		if !ok {
+			panic(err) // todo
+		}
+		return errIsNotLeader
+	}
+	return nil
+}
+
+func (c *KVStoreClient) tryGet(ctx context.Context, key string) (string, error) {
+	client := c.clients[c.leaderIndex.Load()]
+	out, err := client.api.Get(ctx, &kvstore.GetIn{Key: key})
+	if err != nil {
+		st, ok := status.FromError(err)
+		if !ok {
+			panic(err) // todo
+		}
+		if st.Code() == codes.NotFound {
+			return "", ErrNotFound
+		}
+		return "", errIsNotLeader
+	}
+	return out.Value, nil
+
+}
+
+func (c *KVStoreClient) tryConsistentGet(ctx context.Context, key string) (string, error) {
+	client := c.clients[c.leaderIndex.Load()]
+	out, err := client.api.ConsistentGet(ctx, &kvstore.GetIn{Key: key})
+	if err != nil {
+		st, ok := status.FromError(err)
+		if !ok {
+			panic(err) // todo
+		}
+		if st.Code() == codes.NotFound {
+			return "", ErrNotFound
+		}
+		return "", errIsNotLeader
+	}
+	return out.Value, nil
+}
+
+func (c *KVStoreClient) tryDelete(ctx context.Context, key string) error {
+	client := c.clients[c.leaderIndex.Load()]
+	_, err := client.api.Delete(ctx, &kvstore.DeleteIn{Key: key})
+	if err != nil {
+		_, ok := status.FromError(err)
+		if !ok {
+			panic(err) // todo
+		}
+		return errIsNotLeader
+	}
 	return nil
 }
