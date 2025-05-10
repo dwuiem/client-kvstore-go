@@ -46,26 +46,6 @@ func NewKVStoreClient(username, password string, addresses []string, opts []grpc
 	return c, nil
 }
 
-func (c *KVStoreClient) execute(req func() error) error {
-	err := req()
-	if err != nil {
-		except := c.leaderIndex.Load()
-		for i := range c.clients {
-			if i == int(except) {
-				continue
-			}
-			c.setLeader(i)
-			err := req()
-			if err != nil {
-				continue
-			}
-			return nil
-		}
-		return ErrNoAvailableLeader
-	}
-	return nil
-}
-
 func (c *KVStoreClient) Close() error {
 	for _, client := range c.clients {
 		if err := client.closeConn(); err != nil {
@@ -150,6 +130,26 @@ func (c *KVStoreClient) Delete(ctx context.Context, key string) error {
 		return ErrNoAvailableLeader
 	}
 	return err
+}
+
+func (c *KVStoreClient) execute(req func() error) error {
+	err := req()
+	if err != nil {
+		except := c.leaderIndex.Load()
+		for i := range c.clients {
+			if i == int(except) {
+				continue
+			}
+			c.setLeader(i)
+			err := req()
+			if err != nil {
+				continue
+			}
+			return nil
+		}
+		return ErrNoAvailableLeader
+	}
+	return nil
 }
 
 func (c *KVStoreClient) tryPut(ctx context.Context, key, value string, ttl int64) error {
