@@ -43,7 +43,7 @@ func NewKVStoreClient(username, password string, addresses []string) (*KVStoreCl
 		return nil, err
 	}
 	c.leader.Store(ldr)
-	return c, errors.New("error connecting to store")
+	return c, nil
 }
 
 // todo clear unavailable nodes, retries
