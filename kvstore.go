@@ -57,13 +57,6 @@ func (c *KVStoreClient) Close() error {
 	return nil
 }
 
-func (c *KVStoreClient) setLeader(new int) {
-	old := c.leaderIndex.Load()
-	c.leaderIndex.CompareAndSwap(old, int32(new))
-}
-
-// todo handle errors
-
 func (c *KVStoreClient) Put(ctx context.Context, key, value string, ttl int64) error {
 	var err error
 	executeErr := c.execute(func() error {
@@ -130,6 +123,11 @@ func (c *KVStoreClient) Delete(ctx context.Context, key string) error {
 		return ErrNoAvailableLeader
 	}
 	return err
+}
+
+func (c *KVStoreClient) setLeader(new int) {
+	old := c.leaderIndex.Load()
+	c.leaderIndex.CompareAndSwap(old, int32(new))
 }
 
 func (c *KVStoreClient) execute(req func() error) error {
