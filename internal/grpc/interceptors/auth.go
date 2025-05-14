@@ -1,4 +1,4 @@
-package client_kvstore_go
+package interceptors
 
 import (
 	"context"
@@ -11,7 +11,7 @@ const (
 	MDPasswordKey = "password"
 )
 
-func newAuthInterceptor(username, password string) grpc.UnaryClientInterceptor {
+func NewAuthInterceptor(username, password string) grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req interface{}, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		md := metadata.Pairs(
 			MDUsernameKey, username,
